@@ -8,10 +8,10 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.io.File
 import java.lang.reflect.Method
 
-/** ДИАГНОСТИКА v2: ничего не меняет, только пишет в лог LSPosed (тег P3DIAG2). */
+/** ДИАГНОСТИКА v2: ничего не меняет, только пишет в лог LSPosed (тег P3DIAG3). */
 class AnimationHook : IXposedHookLoadPackage {
 
-    private val tag = "P3DIAG2"
+    private val tag = "P3DIAG3"
 
     private fun sig(m: Method) =
         "${m.name}(${m.parameterTypes.joinToString { it.simpleName }}):${m.returnType.simpleName}"
@@ -84,6 +84,29 @@ class AnimationHook : IXposedHookLoadPackage {
                 })
             }
         }.onFailure { XposedBridge.log("$tag: unisoc hook fail $it") }
+
+        // v3: путь запуска с иконки на рабочем столе
+        for (n in listOf("com.android.launcher3.uioverrides.QuickstepLauncher", "com.android.launcher3.Launcher")) {
+            XposedHelpers.findClassIfExists(n, cl)?.let { c ->
+                logCalls(c) { it.name == "getActivityLaunchOptions" || it.name == "startActivitySafely" || it.name == "startActivity" }
+            }
+        }
+        runCatching {
+            val inst = XposedHelpers.findClass("android.app.Instrumentation", cl)
+            inst.declaredMethods.filter { it.name == "execStartActivity" }.forEach { m ->
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(p: MethodHookParam) {
+                        val opts = p.args?.firstOrNull { it is android.os.Bundle } as? android.os.Bundle
+                        val keys = opts?.keySet()?.joinToString(",") ?: "null"
+                        val hasRemote = opts?.keySet()?.any { it.contains("remote", true) || it.contains("transition", true) } ?: false
+                        val st = Throwable().stackTrace.map { it.className.substringAfterLast('.') + "." + it.methodName }
+                            .filter { !it.startsWith("Instrumentation") && !it.startsWith("XC_") && !it.startsWith("LSP") }
+                            .take(8).joinToString(" < ")
+                        XposedBridge.log("$tag: START hasRemote=$hasRemote keys=[$keys] via $st")
+                    }
+                })
+            }
+        }
 
         // makeRemoteAnimation / makeRemoteTransition с аргументами
         runCatching {
