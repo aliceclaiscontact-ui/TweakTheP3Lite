@@ -25,6 +25,7 @@ import java.lang.reflect.Method
 class AnimationHook : IXposedHookLoadPackage {
 
     private val tag = "TweakTheP3Lite"
+    private val DEFAULT_SLOW = 1.8f
     private val pending = ThreadLocal<Array<Any?>>()
     private val busy = ThreadLocal<Boolean>()
 
@@ -98,6 +99,49 @@ class AnimationHook : IXposedHookLoadPackage {
             })
             hooked++
         }
-        XposedBridge.log("$tag: installed, hooks=$hooked")
+        // 3) скорость: растягиваем длительность открытия (Unisoc отдаёт слишком короткую)
+        val scale = runCatching {
+            val prefs = XSharedPreferences("com.aliceclais.realmep3litetweaker", PrefsManager.PREFS_NAME)
+            prefs.reload()
+            prefs.getFloat(PrefsManager.KEY_ANIM_SPEED_SCALE, DEFAULT_SLOW).coerceIn(0.5f, 3f)
+        }.getOrDefault(DEFAULT_SLOW)
+        XposedHelpers.findClassIfExists("com.android.launcher3.QuickstepTransitionManager", cl)
+            ?.declaredMethods?.filter { it.name == "getLaunchAnimDurationByUniPnP" }?.forEach { m ->
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun afterHookedMethod(p: MethodHookParam) {
+                        val d = p.result as? Long ?: return
+                        p.result = (d * scale).toLong()
+                        XposedBridge.log("$tag: launch duration $d -> ${p.result} (x$scale)")
+                    }
+                })
+                hooked++
+            }
+
+        // 4) только лог: что происходит при закрытии и какие длительности используются
+        fun short(o: Any?): String = try { o.toString().take(120) } catch (_: Throwable) { "?" }
+        val watch = mapOf(
+            "com.android.launcher3.QuickstepTransitionManager" to setOf(
+                "getClosingWindowAnimators", "getFallbackClosingWindowAnimators",
+                "shouldPlayFallbackClosingAnimation", "getOpeningWindowAnimators",
+                "createWallpaperOpenAnimations", "getAppToHomeLightAnimators"
+            ),
+            "com.android.launcher3.QuickstepTransitionManager\$WallpaperOpenLauncherAnimationRunner" to null
+        )
+        for ((cn, names) in watch) {
+            val c = XposedHelpers.findClassIfExists(cn, cl) ?: continue
+            c.declaredMethods.filter { (names == null || it.name in names) && !it.name.startsWith("lambda$") }.forEach { m ->
+                runCatching {
+                    XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(p: MethodHookParam) {
+                            XposedBridge.log("$tag: [W] >> ${c.simpleName}.${m.name}")
+                        }
+                        override fun afterHookedMethod(p: MethodHookParam) {
+                            XposedBridge.log("$tag: [W] << ${c.simpleName}.${m.name} = ${short(p.result)}")
+                        }
+                    })
+                }
+            }
+        }
+        XposedBridge.log("$tag: installed, hooks=$hooked, scale=$scale")
     }
 }
