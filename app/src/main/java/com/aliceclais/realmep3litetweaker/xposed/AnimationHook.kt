@@ -6,83 +6,92 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.io.File
+import java.lang.reflect.Method
 
-/**
- * ДИАГНОСТИЧЕСКАЯ версия: ничего не меняет, только пишет в лог LSPosed.
- * Тег для grep: P3DIAG
- */
+/** ДИАГНОСТИКА v2: ничего не меняет, только пишет в лог LSPosed (тег P3DIAG2). */
 class AnimationHook : IXposedHookLoadPackage {
 
-    private val tag = "P3DIAG"
+    private val tag = "P3DIAG2"
 
-    private val interesting = Regex(
-        "checkUx|isLowRam|hasControlRemote|registerRemote|PullUp|Oplus|Unisoc|RemoteAnim|RemoteTransition",
-        RegexOption.IGNORE_CASE
-    )
+    private fun sig(m: Method) =
+        "${m.name}(${m.parameterTypes.joinToString { it.simpleName }}):${m.returnType.simpleName}"
+
+    private fun short(o: Any?): String = try { o.toString().take(160) } catch (_: Throwable) { "?" }
+
+    private fun logCalls(c: Class<*>, filter: (Method) -> Boolean) {
+        for (m in c.declaredMethods) {
+            if (!filter(m)) continue
+            runCatching {
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(p: MethodHookParam) {
+                        XposedBridge.log("$tag: >> ${c.simpleName}.${sig(m)} args=${p.args?.joinToString { short(it) }}")
+                    }
+                    override fun afterHookedMethod(p: MethodHookParam) {
+                        XposedBridge.log("$tag: << ${c.simpleName}.${m.name} = ${short(p.result)}")
+                    }
+                })
+            }
+        }
+    }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.launcher3") return
         if (File("/data/local/tmp/disable_p3_anim").exists()) return
-
         val cl = lpparam.classLoader
         XposedBridge.log("$tag: loaded in ${lpparam.processName}")
 
-        // 1) Какие классы с интересными именами есть в dex
-        runCatching {
-            val pathList = XposedHelpers.getObjectField(cl, "pathList")
-            val elements = XposedHelpers.getObjectField(pathList, "dexElements") as Array<*>
-            for (el in elements) {
-                val dex = XposedHelpers.getObjectField(el, "dexFile") ?: continue
-                val entries = XposedHelpers.callMethod(dex, "entries") as java.util.Enumeration<*>
-                while (entries.hasMoreElements()) {
-                    val n = entries.nextElement() as String
-                    if (n.contains("TransitionManager") || n.contains("FloatingIconView") ||
-                        n.contains("PullUp") || n.contains("RemoteAnim") ||
-                        n.contains("RemoteTransition") || n.contains("Oplus", true) ||
-                        n.contains("Unisoc", true)
-                    ) {
-                        XposedBridge.log("$tag: CLASS $n")
-                    }
-                }
-            }
-        }.onFailure { XposedBridge.log("$tag: class scan failed: $it") }
-
-        // 2) Дамп методов ключевых классов + логирующие хуки (без изменения результата)
-        val targets = listOf(
-            "com.android.launcher3.QuickstepTransitionManager",
-            "com.android.launcher3.PullUpTransitionManager",
-            "com.android.quickstep.PullUpTransitionManager",
-            "com.android.launcher3.views.FloatingIconView"
+        // Полный дамп Oplus-классов анимации (методы + поля)
+        val dump = listOf(
+            "com.android.launcher3.pullup.PullUpTransitionManager",
+            "com.android.launcher3.pullup.PullUpLauncherManager",
+            "com.android.launcher3.OplusLauncherAppTransitionValueAnimator",
+            "com.android.launcher3.QuickstepTransitionManager\$AppLaunchAnimationRunner"
         )
-        for (name in targets) {
-            val c = XposedHelpers.findClassIfExists(name, cl)
-            if (c == null) {
-                XposedBridge.log("$tag: NOCLASS $name")
-                continue
-            }
-            XposedBridge.log("$tag: DUMP $name")
-            for (m in c.declaredMethods) {
-                val sig = "${m.name}(${m.parameterTypes.joinToString { it.simpleName }}):${m.returnType.simpleName}"
-                XposedBridge.log("$tag:   $sig")
-                if (interesting.containsMatchIn(m.name)) {
-                    runCatching {
-                        XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                            override fun afterHookedMethod(param: MethodHookParam) {
-                                XposedBridge.log("$tag: CALL ${c.simpleName}.$sig -> ${param.result}")
-                            }
-                        })
-                    }
-                }
-            }
+        for (n in dump) {
+            val c = XposedHelpers.findClassIfExists(n, cl)
+            if (c == null) { XposedBridge.log("$tag: NOCLASS $n"); continue }
+            XposedBridge.log("$tag: DUMP $n super=${c.superclass?.name}")
+            c.declaredFields.forEach { XposedBridge.log("$tag:   F ${it.type.simpleName} ${it.name}") }
+            c.declaredMethods.forEach { XposedBridge.log("$tag:   M ${sig(it)}") }
         }
 
-        // 3) Каждый вызов ActivityOptions.makeRemoteAnimation / makeRemoteTransition
+        // Логируем вызовы (без изменений): ключевые методы запуска
+        XposedHelpers.findClassIfExists("com.android.launcher3.QuickstepTransitionManager", cl)?.let { c ->
+            logCalls(c) {
+                it.name in setOf(
+                    "getActivityLaunchOptions", "createAppLaunchRunner", "isHomeRoleHeld",
+                    "checkReturnAnimationsFlags", "composeIconLaunchAnimator",
+                    "getOpeningWindowAnimators", "shouldPlayFallbackClosingAnimation",
+                    "getFallbackClosingWindowAnimators", "getClosingWindowAnimators"
+                )
+            }
+        }
+        XposedHelpers.findClassIfExists("com.android.launcher3.pullup.PullUpTransitionManager", cl)?.let { c ->
+            logCalls(c) { !it.name.startsWith("lambda$") && !it.name.startsWith("access$") }
+        }
+        XposedHelpers.findClassIfExists("com.android.launcher3.QuickstepTransitionManager\$AppLaunchAnimationRunner", cl)?.let { c ->
+            logCalls(c) { true }
+        }
+
+        // Unisoc "union anim": решает, регистрировать ли legacy remote animations (только лог)
+        runCatching {
+            val u = XposedHelpers.findClass("android.app.unipnp.UnisocUnionManager", cl)
+            u.declaredMethods.filter { it.name == "useUnionAnim" || it.name == "getUniEnterAnimDuration" }.forEach { m ->
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun afterHookedMethod(p: MethodHookParam) {
+                        XposedBridge.log("$tag: << UnisocUnionManager.${m.name} args=${p.args?.joinToString { short(it) }} = ${short(p.result)}")
+                    }
+                })
+            }
+        }.onFailure { XposedBridge.log("$tag: unisoc hook fail $it") }
+
+        // makeRemoteAnimation / makeRemoteTransition с аргументами
         runCatching {
             val ao = XposedHelpers.findClass("android.app.ActivityOptions", cl)
             ao.declaredMethods.filter { it.name.startsWith("makeRemote") }.forEach { m ->
                 XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        XposedBridge.log("$tag: CALL ActivityOptions.${m.name}")
+                    override fun beforeHookedMethod(p: MethodHookParam) {
+                        XposedBridge.log("$tag: >> ActivityOptions.${sig(m)} args=${p.args?.joinToString { short(it) }}")
                     }
                 })
             }
