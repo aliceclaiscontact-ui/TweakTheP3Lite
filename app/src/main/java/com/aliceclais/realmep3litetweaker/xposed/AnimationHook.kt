@@ -1,10 +1,10 @@
 package com.aliceclais.realmep3litetweaker.xposed
 
 import android.app.ActivityManager
+import android.app.ActivityOptions
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.os.SystemClock
 import android.view.View
 import com.aliceclais.realmep3litetweaker.PrefsManager
 import de.robv.android.xposed.IXposedHookLoadPackage
@@ -22,9 +22,6 @@ class AnimationHook : IXposedHookLoadPackage {
     private val pending = ThreadLocal<Array<Any?>>()
     private val busy = ThreadLocal<Boolean>()
 
-    @Volatile
-    private var warmLaunchUntilMs: Long = 0L
-
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.launcher3") return
         if (runCatching { File("/data/local/tmp/disable_p3_anim").exists() }.getOrDefault(false)) {
@@ -41,8 +38,6 @@ class AnimationHook : IXposedHookLoadPackage {
         }
         val cl = lpparam.classLoader
         runCatching { installLaunchFix(cl) }.onFailure { XposedBridge.log("$tag: launch fix failed: $it") }
-        runCatching { installClosingFix(cl) }.onFailure { XposedBridge.log("$tag: closing fix failed: $it") }
-        runCatching { installWarmStartOverlayHide(cl) }.onFailure { XposedBridge.log("$tag: warm hide failed: $it") }
         runCatching { installSquareCorners(cl) }.onFailure { XposedBridge.log("$tag: corners failed: $it") }
     }
 
@@ -88,8 +83,6 @@ class AnimationHook : IXposedHookLoadPackage {
         }.getOrDefault(false)
     }
 
-    private fun isWarmLaunchActive(): Boolean = SystemClock.uptimeMillis() < warmLaunchUntilMs
-
     private fun installLaunchFix(cl: ClassLoader) {
         val ql = XposedHelpers.findClassIfExists(
             "com.android.launcher3.uioverrides.QuickstepLauncher", cl
@@ -111,15 +104,8 @@ class AnimationHook : IXposedHookLoadPackage {
                         val item = p.args[2]
                         val ctx = p.thisObject as? Context
                         val pkg = extractPackageName(intent, item)
-
                         val isWarm = if (ctx != null && pkg != null) isAppWarmInMemory(ctx, pkg) else false
-                        if (isWarm) {
-                            warmLaunchUntilMs = SystemClock.uptimeMillis() + 900L
-                            XposedBridge.log("$tag: warm start for $pkg")
-                        } else {
-                            warmLaunchUntilMs = 0L
-                        }
-                        pending.set(arrayOf(view, item, pkg))
+                        pending.set(arrayOf(view, item, pkg, isWarm))
                     }
 
                     override fun afterHookedMethod(p: MethodHookParam) {
@@ -137,10 +123,23 @@ class AnimationHook : IXposedHookLoadPackage {
                     val ctx = pending.get() ?: return
                     if (busy.get() == true) return
                     val view = ctx[0] as? View ?: return
+                    val isWarm = ctx[3] as? Boolean ?: false
                     busy.set(true)
                     try {
-                        val r = getOpts.invoke(p.thisObject, view, ctx[1])
-                        if (r != null) p.result = r
+                        if (isWarm) {
+                            val wrapper = p.result ?: return
+                            val scaleOpts = ActivityOptions.makeScaleUpAnimation(
+                                view, 0, 0, view.width.coerceAtLeast(1), view.height.coerceAtLeast(1)
+                            )
+                            XposedHelpers.setObjectField(wrapper, "options", scaleOpts)
+                            XposedBridge.log("$tag: warm scaleUp applied for ${ctx[2]}")
+                        } else {
+                            val r = getOpts.invoke(p.thisObject, view, ctx[1])
+                            if (r != null) {
+                                p.result = r
+                                XposedBridge.log("$tag: cold icon morph applied for ${ctx[2]}")
+                            }
+                        }
                     } catch (t: Throwable) {
                         XposedBridge.log("$tag: fix skipped: $t")
                     } finally {
@@ -151,56 +150,6 @@ class AnimationHook : IXposedHookLoadPackage {
             hooked++
         }
         XposedBridge.log("$tag: launch fix installed, hooks=$hooked")
-    }
-
-    private fun installClosingFix(cl: ClassLoader) {
-        val qtm = XposedHelpers.findClassIfExists(
-            "com.android.launcher3.QuickstepTransitionManager", cl
-        ) ?: return
-
-        var hooked = 0
-        qtm.declaredMethods.filter {
-            it.name == "shouldPlayFallbackClosingAnimation" && it.returnType == Boolean::class.javaPrimitiveType
-        }.forEach { m ->
-            XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                override fun afterHookedMethod(p: MethodHookParam) {
-                    p.result = false
-                }
-            })
-            hooked++
-        }
-
-        qtm.declaredMethods.filter {
-            it.name == "getClosingWindowAnimators" || it.name == "getFallbackClosingWindowAnimators"
-        }.forEach { m ->
-            XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                override fun beforeHookedMethod(p: MethodHookParam) {
-                    XposedBridge.log("$tag: closing call -> ${m.name}")
-                }
-            })
-            hooked++
-        }
-        XposedBridge.log("$tag: closing fix installed, hooks=$hooked")
-    }
-
-    private fun installWarmStartOverlayHide(cl: ClassLoader) {
-        val fiv = XposedHelpers.findClassIfExists(
-            "com.android.launcher3.views.FloatingIconView", cl
-        ) ?: return
-
-        var hooked = 0
-        fiv.declaredMethods.filter { it.name == "update" }
-            .forEach { m ->
-                XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                    override fun afterHookedMethod(p: MethodHookParam) {
-                        if (!isWarmLaunchActive()) return
-                        val v = p.thisObject as? View ?: return
-                        v.alpha = 0f
-                    }
-                })
-                hooked++
-            }
-        XposedBridge.log("$tag: warm overlay hide installed, hooks=$hooked")
     }
 
     private fun installSquareCorners(cl: ClassLoader) {
