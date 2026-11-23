@@ -1,7 +1,6 @@
 package com.aliceclais.realmep3litetweaker.xposed
 
 import android.app.ActivityManager
-import android.app.ActivityOptions
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -16,11 +15,29 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.io.File
 import java.lang.reflect.Method
 
+/**
+ * TweakTheP3Lite: анимации лаунчера realme P3 Lite (com.android.launcher3).
+ *
+ * 1) Запуск с иконки: ActivityContext.startActivitySafely зовёт QuickstepLauncher.makeDefaultActivityOptions
+ *    (обычный makeCustomAnimation). Подменяем результат на QuickstepLauncher.getActivityLaunchOptions(view, item)
+ *    -> настоящая remote-анимация + launch cookie (нужен для возврата в иконку).
+ * 2) Тёплый старт (задача приложения уже есть): та же анимация окна из иконки, но плавающую иконку
+ *    (FloatingIconView) скрываем -- не растягивается на весь экран поверх окна.
+ * 3) Закрытие (кнопка/жест "назад" и "домой" через переход QuickstepLaunchHome): WallpaperOpenLauncherAnimationRunner
+ *    зовёт createWallpaperOpenAnimations(..., fromBack=false) -> только "лёгкая" анимация. Если иконка приложения
+ *    найдена, передаём fromBack=true -> окно сворачивается в иконку (getClosingWindowAnimators).
+ * 4) Квадратные иконки: радиус окна и радиус плавающей иконки = 0.
+ *
+ * Скорость: системный масштаб анимаций. Аварийный выключатель: файл /data/local/tmp/disable_p3_anim.
+ * Любая ошибка -> остаётся оригинальное поведение.
+ */
 class AnimationHook : IXposedHookLoadPackage {
 
     private val tag = "TweakTheP3Lite"
     private val pending = ThreadLocal<Array<Any?>>()
     private val busy = ThreadLocal<Boolean>()
+    private val inRunner = ThreadLocal<Boolean>()
+    @Volatile private var warmUntil = 0L
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.launcher3") return
@@ -38,50 +55,34 @@ class AnimationHook : IXposedHookLoadPackage {
         }
         val cl = lpparam.classLoader
         runCatching { installLaunchFix(cl) }.onFailure { XposedBridge.log("$tag: launch fix failed: $it") }
-        runCatching { installSquareCorners(cl) }.onFailure { XposedBridge.log("$tag: corners failed: $it") }
+        runCatching { installFloatingIcon(cl) }.onFailure { XposedBridge.log("$tag: floating icon failed: $it") }
+        runCatching { installIconClose(cl) }.onFailure { XposedBridge.log("$tag: icon close failed: $it") }
     }
 
-    private fun extractPackageName(intent: Intent?, item: Any?): String? {
+    // ---------- помощники ----------
+
+    private fun packageOf(intent: Intent?, item: Any?): String? {
         intent?.component?.packageName?.let { return it }
         intent?.`package`?.let { return it }
         if (item != null) {
             runCatching {
-                val targetComp = XposedHelpers.callMethod(item, "getTargetComponent") as? ComponentName
-                if (targetComp != null) return targetComp.packageName
-            }
-            runCatching {
-                val itemIntent = XposedHelpers.callMethod(item, "getIntent") as? Intent
-                itemIntent?.component?.packageName?.let { return it }
-                itemIntent?.`package`?.let { return it }
+                (XposedHelpers.callMethod(item, "getTargetComponent") as? ComponentName)?.packageName
+                    ?.let { return it }
             }
         }
         return null
     }
 
+    /** Есть ли уже запущенная задача этого приложения (тёплый старт). При любой ошибке -> false (холодный). */
     @Suppress("DEPRECATION")
-    private fun isAppWarmInMemory(context: Context, pkg: String): Boolean {
-        return runCatching {
-            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return false
+    private fun isWarm(ctx: Context, pkg: String): Boolean = runCatching {
+        val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        am.getRunningTasks(50).any {
+            it.baseActivity?.packageName == pkg || it.topActivity?.packageName == pkg
+        }
+    }.getOrDefault(false)
 
-            val running = runCatching { am.getRunningTasks(30) }.getOrNull().orEmpty()
-            val inRunning = running.any { info ->
-                val numActivities = runCatching { XposedHelpers.getIntField(info, "numActivities") }.getOrDefault(1)
-                (info.baseActivity?.packageName == pkg || info.topActivity?.packageName == pkg) && numActivities > 0
-            }
-            if (inRunning) return true
-
-            val recent = runCatching {
-                am.getRecentTasks(30, ActivityManager.RECENT_IGNORE_UNAVAILABLE)
-            }.getOrNull().orEmpty()
-            recent.any { info ->
-                info.id != -1 && (
-                    info.baseActivity?.packageName == pkg ||
-                    info.topActivity?.packageName == pkg ||
-                    info.baseIntent?.component?.packageName == pkg
-                )
-            }
-        }.getOrDefault(false)
-    }
+    // ---------- 1) запуск с иконки ----------
 
     private fun installLaunchFix(cl: ClassLoader) {
         val ql = XposedHelpers.findClassIfExists(
@@ -99,15 +100,12 @@ class AnimationHook : IXposedHookLoadPackage {
             .forEach { m ->
                 XposedBridge.hookMethod(m, object : XC_MethodHook() {
                     override fun beforeHookedMethod(p: MethodHookParam) {
-                        val view = p.args[0] as? View
-                        val intent = p.args[1] as? Intent
-                        val item = p.args[2]
-                        val ctx = p.thisObject as? Context
-                        val pkg = extractPackageName(intent, item)
-                        val isWarm = if (ctx != null && pkg != null) isAppWarmInMemory(ctx, pkg) else false
-                        pending.set(arrayOf(view, item, pkg, isWarm))
+                        pending.set(arrayOf(p.args[0], p.args[2]))
+                        val pkg = packageOf(p.args[1] as? Intent, p.args[2])
+                        val warm = pkg != null && (p.thisObject as? Context)?.let { isWarm(it, pkg) } == true
+                        warmUntil = if (warm) System.currentTimeMillis() + 3000 else 0L
+                        if (warm) XposedBridge.log("$tag: warm start $pkg")
                     }
-
                     override fun afterHookedMethod(p: MethodHookParam) {
                         pending.remove()
                     }
@@ -123,25 +121,12 @@ class AnimationHook : IXposedHookLoadPackage {
                     val ctx = pending.get() ?: return
                     if (busy.get() == true) return
                     val view = ctx[0] as? View ?: return
-                    val isWarm = ctx[3] as? Boolean ?: false
                     busy.set(true)
                     try {
-                        if (isWarm) {
-                            val wrapper = p.result ?: return
-                            val scaleOpts = ActivityOptions.makeScaleUpAnimation(
-                                view, 0, 0, view.width.coerceAtLeast(1), view.height.coerceAtLeast(1)
-                            )
-                            XposedHelpers.setObjectField(wrapper, "options", scaleOpts)
-                            XposedBridge.log("$tag: warm scaleUp applied for ${ctx[2]}")
-                        } else {
-                            val r = getOpts.invoke(p.thisObject, view, ctx[1])
-                            if (r != null) {
-                                p.result = r
-                                XposedBridge.log("$tag: cold icon morph applied for ${ctx[2]}")
-                            }
-                        }
+                        val r = getOpts.invoke(p.thisObject, view, ctx[1])
+                        if (r != null) p.result = r
                     } catch (t: Throwable) {
-                        XposedBridge.log("$tag: fix skipped: $t")
+                        XposedBridge.log("$tag: launch fix skipped: $t")
                     } finally {
                         busy.remove()
                     }
@@ -152,9 +137,12 @@ class AnimationHook : IXposedHookLoadPackage {
         XposedBridge.log("$tag: launch fix installed, hooks=$hooked")
     }
 
-    private fun installSquareCorners(cl: ClassLoader) {
+    // ---------- 2) плавающая иконка: квадратные углы + скрыть при тёплом старте ----------
+
+    private fun installFloatingIcon(cl: ClassLoader) {
         var hooked = 0
 
+        // радиус скругления окна приложения во время анимации
         XposedHelpers.findClassIfExists("com.android.systemui.shared.system.QuickStepContract", cl)
             ?.declaredMethods?.filter { it.name == "getWindowCornerRadius" && it.returnType == Float::class.javaPrimitiveType }
             ?.forEach { m ->
@@ -164,16 +152,70 @@ class AnimationHook : IXposedHookLoadPackage {
                 hooked++
             }
 
+        // FloatingIconView.update(alpha, rect, progress, shapeStart, cornerRadius, isOpening[, fgIconAlpha])
         XposedHelpers.findClassIfExists("com.android.launcher3.views.FloatingIconView", cl)
             ?.declaredMethods?.filter { it.name == "update" }
             ?.forEach { m ->
-                val idx = m.parameterTypes.indexOfLast { it == Float::class.javaPrimitiveType }
-                if (idx < 0) return@forEach
+                val floatIdx = m.parameterTypes.indexOfLast { it == Float::class.javaPrimitiveType }
+                val boolIdx = m.parameterTypes.indexOfFirst { it == Boolean::class.javaPrimitiveType }
+                if (floatIdx < 0) return@forEach
                 XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(p: MethodHookParam) { p.args[idx] = 0f }
+                    private fun hideNow(p: MethodHookParam): Boolean =
+                        System.currentTimeMillis() < warmUntil &&
+                            (boolIdx < 0 || p.args[boolIdx] == true)
+
+                    override fun beforeHookedMethod(p: MethodHookParam) {
+                        p.args[floatIdx] = 0f                       // квадратные углы
+                        if (hideNow(p)) p.args[0] = 0f              // тёплый старт: иконку не рисуем
+                    }
+                    override fun afterHookedMethod(p: MethodHookParam) {
+                        if (hideNow(p)) (p.thisObject as? View)?.alpha = 0f
+                    }
                 })
                 hooked++
             }
-        XposedBridge.log("$tag: square corners installed, hooks=$hooked")
+        XposedBridge.log("$tag: floating icon hooks=$hooked")
+    }
+
+    // ---------- 3) закрытие в иконку ----------
+
+    private fun installIconClose(cl: ClassLoader) {
+        val qtm = XposedHelpers.findClassIfExists("com.android.launcher3.QuickstepTransitionManager", cl) ?: return
+        val runner = XposedHelpers.findClassIfExists(
+            "com.android.launcher3.QuickstepTransitionManager\$WallpaperOpenLauncherAnimationRunner", cl
+        ) ?: return
+
+        val findView: Method = qtm.declaredMethods.firstOrNull {
+            it.name == "findLauncherView" && it.parameterTypes.size == 1 && it.parameterTypes[0].isArray
+        }?.apply { isAccessible = true } ?: run { XposedBridge.log("$tag: findLauncherView not found"); return }
+
+        var hooked = 0
+        runner.declaredMethods.filter { it.name == "onAnimationStart" && !it.isBridge && !it.isSynthetic }
+            .forEach { m ->
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(p: MethodHookParam) { inRunner.set(true) }
+                    override fun afterHookedMethod(p: MethodHookParam) { inRunner.remove() }
+                })
+                hooked++
+            }
+
+        qtm.declaredMethods.filter { it.name == "createWallpaperOpenAnimations" && it.parameterTypes.size == 6 }
+            .forEach { m ->
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(p: MethodHookParam) {
+                        if (inRunner.get() != true) return
+                        if (p.args[5] == true) return
+                        runCatching {
+                            val v = findView.invoke(p.thisObject, p.args[0])
+                            if (v != null) {
+                                p.args[5] = true
+                                XposedBridge.log("$tag: closing into icon")
+                            }
+                        }
+                    }
+                })
+                hooked++
+            }
+        XposedBridge.log("$tag: icon close hooks=$hooked")
     }
 }
