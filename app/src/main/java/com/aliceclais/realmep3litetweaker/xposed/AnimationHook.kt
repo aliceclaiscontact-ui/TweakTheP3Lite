@@ -26,6 +26,9 @@ import java.lang.reflect.Method
  * 3) Закрытие (кнопка/жест "назад" и "домой" через переход QuickstepLaunchHome): WallpaperOpenLauncherAnimationRunner
  *    зовёт createWallpaperOpenAnimations(..., fromBack=false) -> только "лёгкая" анимация. Если иконка приложения
  *    найдена, передаём fromBack=true -> окно сворачивается в иконку (getClosingWindowAnimators).
+ * 3b) Свайп вверх "домой": в этой сборке LauncherSwipeHandlerV2.createHomeAnimationFactory ВСЕГДА возвращает
+ *    обычную фабрику ($2) -- вызов createIconHomeAnimationFactory вырезан (метод остался, но не вызывается).
+ *    Возвращаем его: если иконка приложения найдена на рабочем столе, окно сворачивается в иконку.
  * 4) Квадратные иконки: радиус окна и радиус плавающей иконки = 0.
  *
  * Скорость: системный масштаб анимаций. Аварийный выключатель: файл /data/local/tmp/disable_p3_anim.
@@ -57,6 +60,7 @@ class AnimationHook : IXposedHookLoadPackage {
         runCatching { installLaunchFix(cl) }.onFailure { XposedBridge.log("$tag: launch fix failed: $it") }
         runCatching { installFloatingIcon(cl) }.onFailure { XposedBridge.log("$tag: floating icon failed: $it") }
         runCatching { installIconClose(cl) }.onFailure { XposedBridge.log("$tag: icon close failed: $it") }
+        runCatching { installSwipeHome(cl) }.onFailure { XposedBridge.log("$tag: swipe home failed: $it") }
     }
 
     // ---------- помощники ----------
@@ -175,6 +179,48 @@ class AnimationHook : IXposedHookLoadPackage {
                 hooked++
             }
         XposedBridge.log("$tag: floating icon hooks=$hooked")
+    }
+
+    // ---------- 3b) свайп "домой" -> в иконку ----------
+
+    private fun installSwipeHome(cl: ClassLoader) {
+        val h = XposedHelpers.findClassIfExists("com.android.quickstep.LauncherSwipeHandlerV2", cl) ?: return
+        val create = h.declaredMethods.firstOrNull {
+            it.name == "createHomeAnimationFactory" && it.parameterTypes.size == 6
+        } ?: run { XposedBridge.log("$tag: createHomeAnimationFactory not found"); return }
+        val findWs = h.declaredMethods.firstOrNull { it.name == "findWorkspaceView" && it.parameterTypes.size == 2 }
+            ?.apply { isAccessible = true } ?: return
+        val iconFactory = h.declaredMethods.firstOrNull { it.name == "createIconHomeAnimationFactory" && it.parameterTypes.size == 2 }
+            ?.apply { isAccessible = true } ?: return
+
+        XposedBridge.hookMethod(create, object : XC_MethodHook() {
+            override fun afterHookedMethod(p: MethodHookParam) {
+                try {
+                    val res = p.result ?: return
+                    if (!res.javaClass.name.endsWith("LauncherSwipeHandlerV2\$2")) return   // уже не стандартная
+                    if (XposedHelpers.getObjectField(p.thisObject, "mContainer") == null) return
+                    val isTranslucent = p.args[2] as? Boolean ?: false
+                    val canEnterPip = p.args[3] as? Boolean ?: false
+                    if (isTranslucent || canEnterPip) return
+
+                    var taskView = p.args[5]
+                    if (taskView == null) {
+                        val rv = XposedHelpers.getObjectField(p.thisObject, "mRecentsView")
+                        taskView = rv?.let { XposedHelpers.callMethod(it, "getRunningTaskView") }
+                    }
+                    val cookies: Any? = if (p.args[5] == null) p.args[0] else emptyList<Any>()
+                    val ws = findWs.invoke(p.thisObject, cookies, taskView) as? View ?: return
+                    if (!ws.isAttachedToWindow || ws.height <= 0) return
+
+                    val f = iconFactory.invoke(p.thisObject, ws, taskView) ?: return
+                    p.result = f
+                    XposedBridge.log("$tag: swipe home -> icon")
+                } catch (t: Throwable) {
+                    XposedBridge.log("$tag: swipe home skipped: $t")
+                }
+            }
+        })
+        XposedBridge.log("$tag: swipe home hook installed")
     }
 
     // ---------- 3) закрытие в иконку ----------
