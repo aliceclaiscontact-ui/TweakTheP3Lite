@@ -41,6 +41,7 @@ class AnimationHook : IXposedHookLoadPackage {
         }
         val cl = lpparam.classLoader
         runCatching { installLaunchFix(cl) }.onFailure { XposedBridge.log("$tag: launch fix failed: $it") }
+        runCatching { installClosingFix(cl) }.onFailure { XposedBridge.log("$tag: closing fix failed: $it") }
         runCatching { installWarmStartOverlayHide(cl) }.onFailure { XposedBridge.log("$tag: warm hide failed: $it") }
         runCatching { installSquareCorners(cl) }.onFailure { XposedBridge.log("$tag: corners failed: $it") }
     }
@@ -113,8 +114,8 @@ class AnimationHook : IXposedHookLoadPackage {
 
                         val isWarm = if (ctx != null && pkg != null) isAppWarmInMemory(ctx, pkg) else false
                         if (isWarm) {
-                            warmLaunchUntilMs = SystemClock.uptimeMillis() + 1200L
-                            XposedBridge.log("$tag: warm start for $pkg -> window zoom without icon overlay")
+                            warmLaunchUntilMs = SystemClock.uptimeMillis() + 900L
+                            XposedBridge.log("$tag: warm start for $pkg")
                         } else {
                             warmLaunchUntilMs = 0L
                         }
@@ -152,25 +153,42 @@ class AnimationHook : IXposedHookLoadPackage {
         XposedBridge.log("$tag: launch fix installed, hooks=$hooked")
     }
 
+    private fun installClosingFix(cl: ClassLoader) {
+        val qtm = XposedHelpers.findClassIfExists(
+            "com.android.launcher3.QuickstepTransitionManager", cl
+        ) ?: return
+
+        var hooked = 0
+        qtm.declaredMethods.filter {
+            it.name == "shouldPlayFallbackClosingAnimation" && it.returnType == Boolean::class.javaPrimitiveType
+        }.forEach { m ->
+            XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                override fun afterHookedMethod(p: MethodHookParam) {
+                    p.result = false
+                }
+            })
+            hooked++
+        }
+
+        qtm.declaredMethods.filter {
+            it.name == "getClosingWindowAnimators" || it.name == "getFallbackClosingWindowAnimators"
+        }.forEach { m ->
+            XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                override fun beforeHookedMethod(p: MethodHookParam) {
+                    XposedBridge.log("$tag: closing call -> ${m.name}")
+                }
+            })
+            hooked++
+        }
+        XposedBridge.log("$tag: closing fix installed, hooks=$hooked")
+    }
+
     private fun installWarmStartOverlayHide(cl: ClassLoader) {
         val fiv = XposedHelpers.findClassIfExists(
             "com.android.launcher3.views.FloatingIconView", cl
         ) ?: return
 
         var hooked = 0
-        fiv.declaredMethods.filter { it.name == "getFloatingIconView" }
-            .forEach { m ->
-                XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                    override fun afterHookedMethod(p: MethodHookParam) {
-                        if (!isWarmLaunchActive()) return
-                        val v = p.result as? View ?: return
-                        v.alpha = 0f
-                        v.visibility = View.INVISIBLE
-                    }
-                })
-                hooked++
-            }
-
         fiv.declaredMethods.filter { it.name == "update" }
             .forEach { m ->
                 XposedBridge.hookMethod(m, object : XC_MethodHook() {
@@ -178,7 +196,6 @@ class AnimationHook : IXposedHookLoadPackage {
                         if (!isWarmLaunchActive()) return
                         val v = p.thisObject as? View ?: return
                         v.alpha = 0f
-                        v.visibility = View.INVISIBLE
                     }
                 })
                 hooked++
