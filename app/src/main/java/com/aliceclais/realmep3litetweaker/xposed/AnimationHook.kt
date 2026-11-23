@@ -1,5 +1,10 @@
 package com.aliceclais.realmep3litetweaker.xposed
 
+import android.app.ActivityManager
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.os.SystemClock
 import android.view.View
 import com.aliceclais.realmep3litetweaker.PrefsManager
 import de.robv.android.xposed.IXposedHookLoadPackage
@@ -11,23 +16,14 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.io.File
 import java.lang.reflect.Method
 
-/**
- * ИСПРАВЛЕНИЕ: в этой сборке лаунчера запуск с иконки идёт через
- * ActivityContext.startActivitySafely -> makeDefaultActivityOptions (QuickstepLauncher),
- * который делает обычный makeCustomAnimation, а настоящую анимацию
- * (QuickstepTransitionManager.getActivityLaunchOptions) не вызывает.
- *
- * Хук: пока идёт QuickstepLauncher.startActivitySafely(view, intent, item),
- * подменяем результат makeDefaultActivityOptions на QuickstepLauncher.getActivityLaunchOptions(view, item).
- *
- * Выключатель: файл /data/local/tmp/disable_p3_anim. Любая ошибка -> остаётся оригинал.
- */
 class AnimationHook : IXposedHookLoadPackage {
 
     private val tag = "TweakTheP3Lite"
-    private val DEFAULT_SLOW = 1.8f
     private val pending = ThreadLocal<Array<Any?>>()
     private val busy = ThreadLocal<Boolean>()
+
+    @Volatile
+    private var warmLaunchUntilMs: Long = 0L
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.launcher3") return
@@ -43,12 +39,57 @@ class AnimationHook : IXposedHookLoadPackage {
                 return
             }
         }
-
-        runCatching { install(lpparam.classLoader) }
-            .onFailure { XposedBridge.log("$tag: install failed: $it") }
+        val cl = lpparam.classLoader
+        runCatching { installLaunchFix(cl) }.onFailure { XposedBridge.log("$tag: launch fix failed: $it") }
+        runCatching { installWarmStartOverlayHide(cl) }.onFailure { XposedBridge.log("$tag: warm hide failed: $it") }
+        runCatching { installSquareCorners(cl) }.onFailure { XposedBridge.log("$tag: corners failed: $it") }
     }
 
-    private fun install(cl: ClassLoader) {
+    private fun extractPackageName(intent: Intent?, item: Any?): String? {
+        intent?.component?.packageName?.let { return it }
+        intent?.`package`?.let { return it }
+        if (item != null) {
+            runCatching {
+                val targetComp = XposedHelpers.callMethod(item, "getTargetComponent") as? ComponentName
+                if (targetComp != null) return targetComp.packageName
+            }
+            runCatching {
+                val itemIntent = XposedHelpers.callMethod(item, "getIntent") as? Intent
+                itemIntent?.component?.packageName?.let { return it }
+                itemIntent?.`package`?.let { return it }
+            }
+        }
+        return null
+    }
+
+    @Suppress("DEPRECATION")
+    private fun isAppWarmInMemory(context: Context, pkg: String): Boolean {
+        return runCatching {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return false
+
+            val running = runCatching { am.getRunningTasks(30) }.getOrNull().orEmpty()
+            val inRunning = running.any { info ->
+                val numActivities = runCatching { XposedHelpers.getIntField(info, "numActivities") }.getOrDefault(1)
+                (info.baseActivity?.packageName == pkg || info.topActivity?.packageName == pkg) && numActivities > 0
+            }
+            if (inRunning) return true
+
+            val recent = runCatching {
+                am.getRecentTasks(30, ActivityManager.RECENT_IGNORE_UNAVAILABLE)
+            }.getOrNull().orEmpty()
+            recent.any { info ->
+                info.id != -1 && (
+                    info.baseActivity?.packageName == pkg ||
+                    info.topActivity?.packageName == pkg ||
+                    info.baseIntent?.component?.packageName == pkg
+                )
+            }
+        }.getOrDefault(false)
+    }
+
+    private fun isWarmLaunchActive(): Boolean = SystemClock.uptimeMillis() < warmLaunchUntilMs
+
+    private fun installLaunchFix(cl: ClassLoader) {
         val ql = XposedHelpers.findClassIfExists(
             "com.android.launcher3.uioverrides.QuickstepLauncher", cl
         ) ?: run { XposedBridge.log("$tag: QuickstepLauncher not found"); return }
@@ -59,14 +100,27 @@ class AnimationHook : IXposedHookLoadPackage {
         }?.apply { isAccessible = true }
             ?: run { XposedBridge.log("$tag: getActivityLaunchOptions not found"); return }
 
-        // 1) запоминаем view/item на время запуска с иконки
         var hooked = 0
         ql.declaredMethods.filter { it.name == "startActivitySafely" && it.parameterTypes.size == 3 }
             .forEach { m ->
                 XposedBridge.hookMethod(m, object : XC_MethodHook() {
                     override fun beforeHookedMethod(p: MethodHookParam) {
-                        pending.set(arrayOf(p.args[0], p.args[2]))
+                        val view = p.args[0] as? View
+                        val intent = p.args[1] as? Intent
+                        val item = p.args[2]
+                        val ctx = p.thisObject as? Context
+                        val pkg = extractPackageName(intent, item)
+
+                        val isWarm = if (ctx != null && pkg != null) isAppWarmInMemory(ctx, pkg) else false
+                        if (isWarm) {
+                            warmLaunchUntilMs = SystemClock.uptimeMillis() + 1200L
+                            XposedBridge.log("$tag: warm start for $pkg -> window zoom without icon overlay")
+                        } else {
+                            warmLaunchUntilMs = 0L
+                        }
+                        pending.set(arrayOf(view, item, pkg))
                     }
+
                     override fun afterHookedMethod(p: MethodHookParam) {
                         pending.remove()
                     }
@@ -74,7 +128,6 @@ class AnimationHook : IXposedHookLoadPackage {
                 hooked++
             }
 
-        // 2) подменяем простые опции на настоящие опции анимации
         ql.declaredMethods.filter {
             it.name == "makeDefaultActivityOptions" && it.returnType.simpleName == "ActivityOptionsWrapper"
         }.forEach { m ->
@@ -86,10 +139,7 @@ class AnimationHook : IXposedHookLoadPackage {
                     busy.set(true)
                     try {
                         val r = getOpts.invoke(p.thisObject, view, ctx[1])
-                        if (r != null) {
-                            p.result = r
-                            XposedBridge.log("$tag: applied launch animation for icon")
-                        }
+                        if (r != null) p.result = r
                     } catch (t: Throwable) {
                         XposedBridge.log("$tag: fix skipped: $t")
                     } finally {
@@ -99,49 +149,65 @@ class AnimationHook : IXposedHookLoadPackage {
             })
             hooked++
         }
-        // 3) скорость: растягиваем длительность открытия (Unisoc отдаёт слишком короткую)
-        val scale = runCatching {
-            val prefs = XSharedPreferences("com.aliceclais.realmep3litetweaker", PrefsManager.PREFS_NAME)
-            prefs.reload()
-            prefs.getFloat(PrefsManager.KEY_ANIM_SPEED_SCALE, DEFAULT_SLOW).coerceIn(0.5f, 3f)
-        }.getOrDefault(DEFAULT_SLOW)
-        XposedHelpers.findClassIfExists("com.android.launcher3.QuickstepTransitionManager", cl)
-            ?.declaredMethods?.filter { it.name == "getLaunchAnimDurationByUniPnP" }?.forEach { m ->
+        XposedBridge.log("$tag: launch fix installed, hooks=$hooked")
+    }
+
+    private fun installWarmStartOverlayHide(cl: ClassLoader) {
+        val fiv = XposedHelpers.findClassIfExists(
+            "com.android.launcher3.views.FloatingIconView", cl
+        ) ?: return
+
+        var hooked = 0
+        fiv.declaredMethods.filter { it.name == "getFloatingIconView" }
+            .forEach { m ->
                 XposedBridge.hookMethod(m, object : XC_MethodHook() {
                     override fun afterHookedMethod(p: MethodHookParam) {
-                        val d = p.result as? Long ?: return
-                        p.result = (d * scale).toLong()
-                        XposedBridge.log("$tag: launch duration $d -> ${p.result} (x$scale)")
+                        if (!isWarmLaunchActive()) return
+                        val v = p.result as? View ?: return
+                        v.alpha = 0f
+                        v.visibility = View.INVISIBLE
                     }
                 })
                 hooked++
             }
 
-        // 4) только лог: что происходит при закрытии и какие длительности используются
-        fun short(o: Any?): String = try { o.toString().take(120) } catch (_: Throwable) { "?" }
-        val watch = mapOf(
-            "com.android.launcher3.QuickstepTransitionManager" to setOf(
-                "getClosingWindowAnimators", "getFallbackClosingWindowAnimators",
-                "shouldPlayFallbackClosingAnimation", "getOpeningWindowAnimators",
-                "createWallpaperOpenAnimations", "getAppToHomeLightAnimators"
-            ),
-            "com.android.launcher3.QuickstepTransitionManager\$WallpaperOpenLauncherAnimationRunner" to null
-        )
-        for ((cn, names) in watch) {
-            val c = XposedHelpers.findClassIfExists(cn, cl) ?: continue
-            c.declaredMethods.filter { (names == null || it.name in names) && !it.name.startsWith("lambda$") }.forEach { m ->
-                runCatching {
-                    XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(p: MethodHookParam) {
-                            XposedBridge.log("$tag: [W] >> ${c.simpleName}.${m.name}")
-                        }
-                        override fun afterHookedMethod(p: MethodHookParam) {
-                            XposedBridge.log("$tag: [W] << ${c.simpleName}.${m.name} = ${short(p.result)}")
-                        }
-                    })
-                }
+        fiv.declaredMethods.filter { it.name == "update" }
+            .forEach { m ->
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun afterHookedMethod(p: MethodHookParam) {
+                        if (!isWarmLaunchActive()) return
+                        val v = p.thisObject as? View ?: return
+                        v.alpha = 0f
+                        v.visibility = View.INVISIBLE
+                    }
+                })
+                hooked++
             }
-        }
-        XposedBridge.log("$tag: installed, hooks=$hooked, scale=$scale")
+        XposedBridge.log("$tag: warm overlay hide installed, hooks=$hooked")
+    }
+
+    private fun installSquareCorners(cl: ClassLoader) {
+        var hooked = 0
+
+        XposedHelpers.findClassIfExists("com.android.systemui.shared.system.QuickStepContract", cl)
+            ?.declaredMethods?.filter { it.name == "getWindowCornerRadius" && it.returnType == Float::class.javaPrimitiveType }
+            ?.forEach { m ->
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun afterHookedMethod(p: MethodHookParam) { p.result = 0f }
+                })
+                hooked++
+            }
+
+        XposedHelpers.findClassIfExists("com.android.launcher3.views.FloatingIconView", cl)
+            ?.declaredMethods?.filter { it.name == "update" }
+            ?.forEach { m ->
+                val idx = m.parameterTypes.indexOfLast { it == Float::class.javaPrimitiveType }
+                if (idx < 0) return@forEach
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(p: MethodHookParam) { p.args[idx] = 0f }
+                })
+                hooked++
+            }
+        XposedBridge.log("$tag: square corners installed, hooks=$hooked")
     }
 }
